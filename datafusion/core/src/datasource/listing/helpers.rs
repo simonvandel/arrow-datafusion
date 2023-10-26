@@ -330,7 +330,49 @@ pub async fn pruned_partition_list<'a>(
         ));
     }
 
-    let partitions = list_partitions(store, table_path, partition_cols.len()).await?;
+    use datafusion_expr::expr::*;
+    use datafusion_expr::*;
+
+    let mut partitioned_table_path: Option<ListingTableUrl> = None;
+    let mut list_partiton_depth = partition_cols.len();
+
+    for filter in filters {
+        match filter {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                Operator::Eq => match (left.as_ref(), right.as_ref()) {
+                    (
+                        &Expr::Column(Column {
+                            ref name,
+                            relation: _,
+                        }),
+                        &Expr::Literal(ref lit),
+                    ) => {
+                        if name == &partition_cols[0].0 {
+                            partitioned_table_path = Some(
+                                ListingTableUrl::parse(format!(
+                                    "{}/{}={}",
+                                    table_path.as_str(),
+                                    name,
+                                    lit,
+                                ))
+                                .unwrap(),
+                            );
+                            list_partiton_depth -= 1;
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let partitions = list_partitions(
+        store,
+        partitioned_table_path.as_ref().unwrap_or(table_path),
+        list_partiton_depth,
+    )
+    .await?;
     debug!("Listed {} partitions", partitions.len());
 
     let pruned =
