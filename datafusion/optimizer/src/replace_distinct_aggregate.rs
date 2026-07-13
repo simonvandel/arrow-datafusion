@@ -22,7 +22,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Column, Result};
+use datafusion_common::{Column, Dependency, Result};
 use datafusion_expr::expr_rewriter::normalize_cols;
 use datafusion_expr::utils::expand_wildcard;
 use datafusion_expr::{Aggregate, Distinct, DistinctOn, Expr, LogicalPlan};
@@ -101,9 +101,14 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
 
                 let field_count = input.schema().fields().len();
                 for dep in input.schema().functional_dependencies().iter() {
-                    // If distinct is exactly the same with a previous GROUP BY, we can
-                    // simply remove it:
-                    if dep.source_indices.len() >= field_count
+                    // If the input is already unique on all of its columns (e.g.
+                    // it is a GROUP BY over exactly these columns), the DISTINCT
+                    // is a no-op and we can simply remove it. The dependency mode
+                    // must be `Single`: a `Multi` dependence (e.g. a former key
+                    // downgraded by a join) means equal rows may occur multiple
+                    // times, so the DISTINCT still has work to do.
+                    if dep.mode == Dependency::Single
+                        && dep.source_indices.len() >= field_count
                         && dep.source_indices[..field_count]
                             .iter()
                             .enumerate()
@@ -263,6 +268,43 @@ mod tests {
         Projection: test.a, test.b
           Aggregate: groupBy=[[test.a, test.b]], aggr=[[]]
             TableScan: test
+        ")
+    }
+
+    #[test]
+    fn do_not_eliminate_distinct_on_key_downgraded_by_join() -> Result<()> {
+        use datafusion_common::{Constraint, Constraints};
+        use datafusion_expr::JoinType;
+        use datafusion_expr::logical_plan::builder::table_source_with_constraints;
+
+        // `l.a` is a primary key, but the LEFT JOIN can emit an `l` row once
+        // per matching `r` row, which downgrades the key's dependency mode to
+        // `Multi`. The DISTINCT still removes real duplicates and must be
+        // replaced with an aggregation, not dropped.
+        let schema = Schema::new(test_table_scan_fields());
+        let left = LogicalPlanBuilder::scan(
+            "l",
+            table_source_with_constraints(
+                &schema,
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            ),
+            None,
+        )?
+        .build()?;
+        let right = test_table_scan_with_name("r")?;
+
+        let plan = LogicalPlanBuilder::from(left)
+            .join(right, JoinType::Left, (vec!["l.a"], vec!["r.b"]), None)?
+            .project(vec![col("l.a")])?
+            .distinct()?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[l.a]], aggr=[[]]
+          Projection: l.a
+            Left Join: l.a = r.b
+              TableScan: l
+              TableScan: r
         ")
     }
 
