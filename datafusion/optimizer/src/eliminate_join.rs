@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`EliminateJoin`] rewrites inner joins to simpler forms to make them cheaper
-//! to evaluate. We implement two distinct rewrites:
+//! [`EliminateJoin`] rewrites joins to simpler forms to make them cheaper
+//! to evaluate. We implement three distinct rewrites:
 //!
 //! * An inner join can be rewritten to an empty relation if the join condition
 //!   is trivially false.
@@ -31,6 +31,16 @@
 //!        join's ancestors are duplicate-insensitive (e.g., DISTINCT) or we can use
 //!        functional dependencies to prove that each L row matches at most one R
 //!        row (R is provably unique on the join keys).
+//!
+//! * A left outer join `L ⟕ R` can be removed entirely, i.e. replaced by `L`,
+//!   under the same two conditions. Unlike an inner join, a left join
+//!   preserves every row of L whether or not it has a match in R, so when R's
+//!   columns are unused and R cannot multiply L's rows the join has no
+//!   observable effect at all. Such joins commonly appear in generated SQL
+//!   and in queries over views that join in lookup tables the query does not
+//!   read. A join filter does not prevent this rewrite: for a left join it
+//!   only decides whether a left row is matched or null-padded, and either
+//!   way the row is emitted.
 //!
 //! # Overview
 //!
@@ -142,8 +152,10 @@ impl LiveColumns {
     }
 }
 
-/// Rewrites an inner join to a semi join when one input only filters the other,
-/// and replaces an always-false inner join with an empty relation.
+/// Rewrites an inner join to a semi join when one input only filters the
+/// other, removes a left outer join whose right side is unused and cannot
+/// multiply left rows, and replaces an always-false inner join with an empty
+/// relation.
 #[derive(Default, Debug)]
 pub struct EliminateJoin;
 
@@ -393,6 +405,30 @@ fn rewrite_join(
     }
 
     let (visible_left, visible_right) = split_join_output_columns(&join, live);
+
+    // A LEFT JOIN preserves every left row, so when nothing above the join
+    // references the right side's columns and the right side cannot multiply
+    // left rows (the ancestors are duplicate-insensitive, or the right side
+    // is unique on the join keys), the join has no observable effect and can
+    // be replaced by its left input. A join filter cannot prevent this: it
+    // only decides whether a left row is matched or null-padded, and either
+    // way the row is emitted.
+    if join.join_type == JoinType::Left
+        && visible_right.is_empty()
+        && (duplicate_insensitive
+            || side_unique_on_join(
+                join.right.schema(),
+                join.on.iter().map(|(_, right)| right),
+                join.null_equality,
+            ))
+    {
+        let left = rewrite_subtree(
+            Arc::unwrap_or_clone(join.left),
+            visible_left,
+            duplicate_insensitive,
+        )?;
+        return Ok(Transformed::yes(left.data));
+    }
 
     let rewritten_join_type =
         rewritten_join_type(&join, &visible_left, &visible_right, duplicate_insensitive);
@@ -1133,6 +1169,256 @@ mod tests {
             TableScan: l
             TableScan: r
         ")
+    }
+
+    // ----- LEFT JOIN elimination tests -----
+
+    #[test]
+    fn left_join_removed_when_right_unique_and_unused() -> Result<()> {
+        // The right side is unique on the join key (PK) and none of its
+        // columns are referenced above the join. A LEFT JOIN preserves every
+        // left row, so the join has no observable effect and is removed
+        // entirely (not just rewritten to a semi join like an inner join).
+        let plan = left_outer_join_right_with_constraints(primary_key_on_id())?
+            .project(vec![col("l.x")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_removed_with_join_filter() -> Result<()> {
+        // A join filter referencing the right side does not block removal of
+        // a LEFT JOIN: the filter only decides whether a left row is matched
+        // or null-padded, and either way the row is emitted exactly once.
+        let right = scan("r", &test_schema(), primary_key_on_id())?;
+        let plan =
+            LogicalPlanBuilder::from(scan("l", &test_schema(), Constraints::default())?)
+                .join(
+                    right,
+                    JoinType::Left,
+                    (vec!["l.id"], vec!["r.id"]),
+                    Some(col("r.y").gt(col("l.x"))),
+                )?
+                .project(vec![col("l.x")])?
+                .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_kept_when_right_column_used() -> Result<()> {
+        let plan = left_outer_join_right_with_constraints(primary_key_on_id())?
+            .project(vec![col("l.x"), col("r.y")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x, r.y
+          Left Join: l.id = r.id
+            TableScan: l
+            TableScan: r
+        ")
+    }
+
+    #[test]
+    fn left_join_kept_without_uniqueness() -> Result<()> {
+        // Without uniqueness metadata a left row may match several right rows
+        // and be duplicated, so the join must stay.
+        let plan = left_outer_join_right_with_constraints(Constraints::default())?
+            .project(vec![col("l.x")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x
+          Left Join: l.id = r.id
+            TableScan: l
+            TableScan: r
+        ")
+    }
+
+    #[test]
+    fn left_join_removed_for_duplicate_insensitive_parent() -> Result<()> {
+        // A no-aggregate GROUP BY only observes which group-key values exist.
+        // A LEFT JOIN emits every left row at least once, so even a
+        // non-unique right side cannot change the result and the join is
+        // removed.
+        let plan = left_outer_join_right_with_constraints(Constraints::default())?
+            .aggregate(vec![col("l.x")], Vec::<Expr>::new())?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[l.x]], aggr=[[]]
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_kept_under_counting_aggregate_without_uniqueness() -> Result<()> {
+        // `count` observes row multiplicity, so with a non-unique right side
+        // (which may duplicate left rows) the join must stay.
+        let plan = left_outer_join_right_with_constraints(Constraints::default())?
+            .aggregate(vec![col("l.x")], vec![count(col("l.id"))])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[l.x]], aggr=[[count(l.id)]]
+          Left Join: l.id = r.id
+            TableScan: l
+            TableScan: r
+        ")
+    }
+
+    #[test]
+    fn left_join_removed_under_counting_aggregate_when_unique() -> Result<()> {
+        // With a right side unique on the join key, each left row is emitted
+        // exactly once, so the join is removable even under a
+        // duplicate-sensitive aggregate.
+        let plan = left_outer_join_right_with_constraints(primary_key_on_id())?
+            .aggregate(vec![col("l.x")], vec![count(col("l.id"))])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[l.x]], aggr=[[count(l.id)]]
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_removed_below_filter_on_left_columns() -> Result<()> {
+        // A filter between the projection and the join keeps its predicate
+        // columns live; when those are all left columns, the join is still
+        // removed and the filter is preserved above the left input.
+        let plan = left_outer_join_right_with_constraints(primary_key_on_id())?
+            .filter(col("l.y").gt(lit(10_i32)))?
+            .project(vec![col("l.x")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x
+          Filter: l.y > Int32(10)
+            TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_kept_when_filter_references_right() -> Result<()> {
+        // The WHERE clause reads `r.y`, so the right side is live and the
+        // join must stay. (`EliminateOuterJoin` may separately turn this
+        // into an inner join, but that is not this rule's job.)
+        let plan = left_outer_join_right_with_constraints(primary_key_on_id())?
+            .filter(col("r.y").gt(lit(10_i32)))?
+            .project(vec![col("l.x")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.x
+          Filter: r.y > Int32(10)
+            Left Join: l.id = r.id
+              TableScan: l
+              TableScan: r
+        ")
+    }
+
+    #[test]
+    fn left_join_on_nullable_unique_key_removed_under_null_equals_nothing() -> Result<()>
+    {
+        // Under the default `NullEqualsNothing` semantics a NULL key matches
+        // nothing, so a nullable UNIQUE key still guarantees at most one
+        // match per left row and the join is removed.
+        let left = scan("l", &test_schema(), Constraints::default())?;
+        let right = scan("r", &test_schema(), unique_on_x())?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join(right, JoinType::Left, (vec!["l.x"], vec!["r.x"]), None)?
+            .project(vec![col("l.id")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.id
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn left_join_on_nullable_unique_key_kept_under_null_equals_null() -> Result<()> {
+        // A UNIQUE constraint permits multiple NULLs. With `NullEqualsNull`
+        // semantics several NULL-keyed right rows could all match a
+        // NULL-keyed left row and duplicate it, so the join must stay.
+        let left = scan("l", &test_schema(), Constraints::default())?;
+        let right = scan("r", &test_schema(), unique_on_x())?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join_detailed(
+                right,
+                JoinType::Left,
+                (vec!["l.x"], vec!["r.x"]),
+                None,
+                NullEquality::NullEqualsNull,
+            )?
+            .project(vec![col("l.id")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.id
+          Left Join: l.x = r.x
+            TableScan: l
+            TableScan: r
+        ")
+    }
+
+    #[test]
+    fn keyless_left_join_removed_for_duplicate_insensitive_parent() -> Result<()> {
+        // Even a LEFT JOIN with no equi-join keys emits every left row at
+        // least once (matched or null-padded), so a duplicate-insensitive
+        // parent lets it be removed regardless of uniqueness.
+        let left = scan("l", &test_schema(), Constraints::default())?;
+        let right = scan("r", &test_schema(), Constraints::default())?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join_on(right, JoinType::Left, Some(col("l.x").gt(col("r.x"))))?
+            .aggregate(vec![col("l.x")], Vec::<Expr>::new())?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[l.x]], aggr=[[]]
+          TableScan: l
+        ")
+    }
+
+    #[test]
+    fn keyless_left_join_kept_for_duplicate_sensitive_parent() -> Result<()> {
+        // Without equi-join keys uniqueness cannot be established, so a
+        // duplicate-sensitive parent keeps the join.
+        let left = scan("l", &test_schema(), Constraints::default())?;
+        let right = scan("r", &test_schema(), Constraints::default())?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join_on(right, JoinType::Left, Some(col("l.x").gt(col("r.x"))))?
+            .project(vec![col("l.id")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: l.id
+          Left Join:  Filter: l.x > r.x
+            TableScan: l
+            TableScan: r
+        ")
+    }
+
+    fn left_outer_join_right_with_constraints(
+        right_constraints: Constraints,
+    ) -> Result<LogicalPlanBuilder> {
+        let left = scan("l", &test_schema(), Constraints::default())?;
+        let right = scan("r", &test_schema(), right_constraints)?;
+
+        LogicalPlanBuilder::from(left).join(
+            right,
+            JoinType::Left,
+            (vec!["l.id"], vec!["r.id"]),
+            None,
+        )
     }
 
     fn left_join_right() -> Result<LogicalPlanBuilder> {
